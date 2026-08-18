@@ -206,13 +206,11 @@ Future<File> saveImage(Uint8List imageBytes, String filePath) async {
 Future<String> convertBackImage(Uint8List editedImageBytes) async {
   var documentDirectory = await getApplicationDocumentsDirectory();
   String timestamp = "${DateTime.timestamp()}";
-  File file = File("");
-  // Save as PNG
-  file = await saveImage(
+  // Only the PNG is written. A second copy used to be saved as `<ts>_image.jpg`
+  // holding the *same PNG bytes* under a lying extension — nothing ever read it,
+  // and it doubled the disk this directory grows by on every single render.
+  final File file = await saveImage(
       editedImageBytes, '${documentDirectory.path}/${timestamp}_image.png');
-  // Or save as JPG
-  await saveImage(
-      editedImageBytes, '${documentDirectory.path}/${timestamp}_image.jpg');
   return file.path;
 }
 

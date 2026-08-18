@@ -18,6 +18,11 @@ class ImageSendScreen extends StatefulWidget {
 class _ImageSendScreenState extends State<ImageSendScreen> {
   final List<TextData> _textDataList = [];
   final List<TextDataListitem> textDataAllList = [];
+
+  /// True while "Create All" is running. Guards re-entry and drives the progress
+  /// affordance — the run is now sequential, so without this the button looks dead.
+  bool _isCreatingAll = false;
+  int _createdCount = 0;
   double imageAspectRatio = 0;
   Size? preImageSize;
   Size? _imageSize;
@@ -72,7 +77,12 @@ class _ImageSendScreenState extends State<ImageSendScreen> {
     setState(() {});
   }
 
-  void editImage(TextDataListitem textData) async {
+  /// Renders one card and writes its PDF.
+  ///
+  /// [showResult] is false during "Create All": pushing a route per guest is what
+  /// used to stack N `ImageShow` screens on top of each other.
+  Future<void> editImage(TextDataListitem textData,
+      {bool showResult = true}) async {
     String fileName = "";
     List<TextData> newTextData = [];
 
@@ -94,6 +104,7 @@ class _ImageSendScreenState extends State<ImageSendScreen> {
     // String message = "🙏 નવચંડી પૂજામાં તમારું હાર્દિક સ્વાગત છે. 🙏";
     // sharePdfToWhatsApp(phoneNumber, message, pdfUrl);
 
+    if (!showResult || !mounted) return;
     Navigator.push(
         context,
         MaterialPageRoute(
@@ -101,6 +112,33 @@ class _ImageSendScreenState extends State<ImageSendScreen> {
             image: image,
           ),
         ));
+  }
+
+  /// Renders every guest's card **one at a time**.
+  ///
+  /// This used to be a bare `for` loop calling an un-awaited `async void`, so a
+  /// 20-guest list decoded 20 full images concurrently, raced on disk and stacked
+  /// 20 routes. Sequential is slower per run and is the only version that survives
+  /// a real guest list.
+  Future<void> createAll() async {
+    if (_isCreatingAll || textDataAllList.isEmpty) return;
+    setState(() {
+      _isCreatingAll = true;
+      _createdCount = 0;
+    });
+    try {
+      for (final element in textDataAllList) {
+        await editImage(element, showResult: false);
+        if (!mounted) return;
+        setState(() => _createdCount++);
+      }
+    } finally {
+      if (mounted) setState(() => _isCreatingAll = false);
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("Created $_createdCount PDFs in Downloads")),
+    );
   }
 
   @override
@@ -124,22 +162,30 @@ class _ImageSendScreenState extends State<ImageSendScreen> {
           ],
         ),
         bottomNavigationBar: InkWell(
-          onTap: () {
-            for (var element in textDataAllList) {
-              editImage(element);
-            }
-          },
+          onTap: _isCreatingAll ? null : createAll,
           child: Container(
             margin: EdgeInsets.symmetric(horizontal: 20, vertical: 10),
             padding: EdgeInsets.all(10),
             decoration: BoxDecoration(
-                color: Colors.blue, borderRadius: BorderRadius.circular(40)),
+                color: _isCreatingAll ? Colors.blue.shade300 : Colors.blue,
+                borderRadius: BorderRadius.circular(40)),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
+                if (_isCreatingAll) ...[
+                  SizedBox(
+                    height: 16,
+                    width: 16,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.white),
+                  ),
+                  SizedBox(width: 10),
+                ],
                 Text(
-                  "Create All",
+                  _isCreatingAll
+                      ? "Creating $_createdCount of ${textDataAllList.length}…"
+                      : "Create All",
                   style: TextStyle(
                       fontWeight: FontWeight.w500,
                       color: Colors.white,
