@@ -57,7 +57,11 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   void getAllImagedata() async {
-    imageEditList = await dbService.getAllImageEdits();
+    final all = await dbService.getAllImageEdits();
+    // Soft-deleted rows are filtered out HERE, not inside itemBuilder. Returning an
+    // empty Container() per deleted row still made ListView.separated allocate the
+    // slot and its separator, which is what left visible gaps in the list.
+    imageEditList = all.where((e) => e.deleteImage != 1).toList();
     setState(() {});
   }
 
@@ -91,9 +95,6 @@ class _DashboardScreenState extends State<DashboardScreen>
                 itemCount: imageEditList.length,
                 itemBuilder: (context, index) {
                   var imageData = imageEditList[index];
-                  if (imageData.deleteImage == 1) {
-                    return Container();
-                  }
                   return Container(
                     height: 250,
                     margin: EdgeInsets.symmetric(horizontal: 30),
