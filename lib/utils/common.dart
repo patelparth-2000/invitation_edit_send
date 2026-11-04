@@ -1,278 +1,355 @@
 import 'dart:io';
-import 'dart:typed_data';
-import 'package:flutter/material.dart';
+import 'dart:isolate';
+import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/painting.dart';
 import 'package:flutter/services.dart' show rootBundle;
-import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
-import 'package:translator/translator.dart';
+
+/// Fallback background used when a card has no picked image.
+/// The filename is misspelled on purpose (plan trap T-6): it is the real asset name.
+const String fallbackCardAsset = 'assets/images/invitetion_card.jpg';
+
+// ---------------------------------------------------------------------------
+// Card text style: ONE definition shared by the editor, the previews and the
+// exporter, so what the owner designs is what gets burned in (F-4, F-5).
+// ---------------------------------------------------------------------------
+
+/// Font family of text on a card. Latin glyphs come from PlaywriteIN; any
+/// character it lacks (Gujarati) falls back to the bundled Noto Serif Gujarati.
+const String cardFontFamily = 'PlaywriteIN';
+const List<String> cardFontFallback = ['NotoSerif'];
+
+/// Editor font size of a field at scale 1, in preview logical pixels.
+const double fieldBaseFontSize = 8;
+
+/// Value stored in the `font_type` column for layouts saved by this version.
+const String cardFontTypeId = 'flutter:PlaywriteIN+NotoSerif';
+
+/// Style of a field at [scale]. [pixelScale] converts preview pixels to output
+/// pixels (1 in the editor; imageWidth / previewWidth when exporting).
+TextStyle cardFieldStyle({
+  required double scale,
+  required Color color,
+  double pixelScale = 1,
+}) =>
+    TextStyle(
+      fontFamily: cardFontFamily,
+      fontFamilyFallback: cardFontFallback,
+      fontWeight: FontWeight.bold,
+      fontSize: fieldBaseFontSize * scale * pixelScale,
+      color: color,
+    );
+
+/// One field to draw, positioned exactly where the editor shows it:
+/// [topLeft] is the `Positioned(left:, top:)` of the field's Text widget, in
+/// preview logical pixels.
+@immutable
+class FieldPaint {
+  const FieldPaint({
+    required this.text,
+    required this.topLeft,
+    required this.scale,
+    required this.color,
+  });
+
+  final String text;
+  final Offset topLeft;
+  final double scale;
+  final Color color;
+}
+
+/// A decoded card background as raw RGBA, ready to be shipped to an isolate.
+@immutable
+class DecodedCard {
+  const DecodedCard(this.width, this.height, this.rgba);
+  final int width;
+  final int height;
+  final Uint8List rgba;
+
+  img.Image toImage() => img.Image.fromBytes(
+        width: width,
+        height: height,
+        bytes: Uint8List.fromList(rgba).buffer,
+        numChannels: 4,
+      );
+}
+
+/// One rasterised field: straight-alpha RGBA placed at ([x], [y]) in the card.
+@immutable
+class RasterLayer {
+  const RasterLayer(this.rgba, this.width, this.height, this.x, this.y);
+  final Uint8List rgba;
+  final int width;
+  final int height;
+  final int x;
+  final int y;
+}
 
 Future<Uint8List> loadAssetImageAsUint8List(String assetPath) async {
-  ByteData byteData = await rootBundle.load(assetPath);
+  final ByteData byteData = await rootBundle.load(assetPath);
   return byteData.buffer.asUint8List();
 }
 
-Future<Uint8List> loadImageFromFile(String filePath) async {
-  File file = File(filePath);
-  return await file.readAsBytes();
+Future<Uint8List> loadImageFromFile(String filePath) =>
+    File(filePath).readAsBytes();
+
+Future<Uint8List> _loadCardBytes(String? imagePath) =>
+    (imagePath != null && imagePath.isNotEmpty)
+        ? loadImageFromFile(imagePath)
+        : loadAssetImageAsUint8List(fallbackCardAsset);
+
+/// Decodes without throwing (package:image throws on some corrupt input).
+img.Image? safeDecode(Uint8List bytes) {
+  try {
+    return img.decodeImage(bytes);
+  } catch (_) {
+    return null;
+  }
 }
 
-Future<Uint8List> loadNetworkImageAsUint8List(String url) async {
-  http.Response response = await http.get(Uri.parse(url));
-  return response.bodyBytes;
+/// Pure: decode [bytes] to RGBA, optionally downscaled so the width is at most
+/// [maxWidth]. Runs inside an isolate.
+DecodedCard? decodeCardBytes(Uint8List bytes, {int? maxWidth}) {
+  var image = safeDecode(bytes);
+  if (image == null) return null;
+  if (maxWidth != null && image.width > maxWidth) {
+    image = img.copyResize(image, width: maxWidth);
+  }
+  final rgba = image.convert(numChannels: 4, format: img.Format.uint8);
+  return DecodedCard(
+      rgba.width, rgba.height, rgba.getBytes(order: img.ChannelOrder.rgba));
 }
 
-class TextData {
-  String text;
-  double dx;
-  double dy;
-  double scale;
-
-  TextData(this.text, this.dx, this.dy, this.scale);
-}
-
-Future<img.BitmapFont> loadBitmapFont(String fntPath, String imagePath) async {
-  // Load the .fnt file as a string
-  String fntData = await rootBundle.loadString(fntPath);
-
-  // Load the font image as a Uint8List
-  Uint8List imageBytes = await rootBundle
-      .load(imagePath)
-      .then((data) => data.buffer.asUint8List());
-  img.Image fontImage = img.decodeImage(imageBytes)!;
-
-  // Create a BitmapFont from the fnt data and image
-  return img.BitmapFont.fromFnt(fntData, fontImage);
-}
-
-Future<img.BitmapFont> loadBitmapFontFromZip(String zipPath) async {
-  // Load the zip file as bytes
-  final ByteData data = await rootBundle.load(zipPath);
-  final List<int> bytes = data.buffer.asUint8List();
-
-  // Load the BitmapFont from the zip bytes
-  img.BitmapFont font = img.BitmapFont.fromZip(bytes);
-  return font;
-}
-
-/// The bitmap font every export is rendered with.
-///
-/// KNOWN LIMITATION — Gujarati cannot be burned into a card.
-/// This is a **Latin-only** bitmap font. `img.BitmapFont.fromZip` consumes a
-/// pre-rasterised ZIP, not a TTF, so `fonts/NotoSerifGujarati-VariableFont_wght.ttf`
-/// cannot be used here — it is registered in pubspec.yaml and therefore applies to
-/// Flutter *widgets* only. Every character outside this font's atlas renders as
-/// nothing in the exported image and PDF.
-///
-/// That matters because this app ships Gujarati fonts, a `translator` dependency and
-/// a drafted Gujarati greeting, so it was plainly built for a Gujarati event — and
-/// the export path is the one place that cannot serve it.
-///
-/// Two ways out, neither a small edit:
-///   1. Rasterise NotoSerifGujarati into a bitmap-font ZIP (BMFont/Hiero) and load it
-///      here. Cheapest, but one fixed size and one script per atlas.
-///   2. Stop using `img.drawString` and render text with Flutter's own engine
-///      (`ui.ParagraphBuilder` + `ui.Canvas` -> `ui.Image`), then composite that.
-///      Handles any TTF, any size and complex scripts properly. This is the real fix.
-Future<ByteData> loadAssetFont() async {
-  ByteData imageData = await rootBundle
-      .load("fonts/font_zip/PlaywriteIN-VariableFont_wght.ttf (2).zip");
-  return imageData;
-}
-
-Future<String> translateText(String locale, String text) async {
-  String translatorText = "";
-  final translator = GoogleTranslator();
-  await translator.translate(text, to: locale).then((value) {
-    translatorText = value.text;
-  });
-  return translatorText;
+/// Reads and decodes a card background off the UI isolate.
+/// Throws [FormatException] when the image cannot be decoded.
+Future<DecodedCard> decodeCard(String? imagePath, {int? maxWidth}) async {
+  final bytes = await _loadCardBytes(imagePath);
+  final card =
+      await Isolate.run(() => decodeCardBytes(bytes, maxWidth: maxWidth));
+  if (card == null) {
+    throw const FormatException('The card image could not be opened.');
+  }
+  return card;
 }
 
 Future<Size?> getImageSize(String imagePath) async {
-  Uint8List imageBytes = await loadImageFromFile(imagePath);
-
-  var image = img.decodeImage(imageBytes);
-  if (image == null) return null;
-
-  // Actual image dimensions
-  int actualImageWidth = image.width;
-  int actualImageHeight = image.height;
-  return Size(actualImageWidth.toDouble(), actualImageHeight.toDouble());
+  final Uint8List imageBytes = await loadImageFromFile(imagePath);
+  final dims = await Isolate.run(() {
+    final image = safeDecode(imageBytes);
+    return image == null ? null : (image.width, image.height);
+  });
+  if (dims == null) return null;
+  return Size(dims.$1.toDouble(), dims.$2.toDouble());
 }
 
-Future<String> addTextToImage(
-  String? imagePath,
-  List<TextData> textDataList,
+/// Rasterises [fields] with Flutter's text engine (any font, any script),
+/// scaled from [previewSize] to an output of [outWidth] x [outHeight].
+/// Must run on the root isolate (`dart:ui` painting).
+Future<List<RasterLayer>> rasteriseFields(
+  List<FieldPaint> fields,
   Size previewSize,
-  num r,
-  num g,
-  num b,
+  int outWidth,
+  int outHeight,
 ) async {
-  String editedImage = "";
-  Uint8List imageBytes;
-  if (imagePath != null && imagePath != "") {
-    imageBytes = await loadImageFromFile(imagePath);
-  } else {
-    imageBytes =
-        await loadAssetImageAsUint8List('assets/images/invitetion_card.jpg');
+  if (previewSize.width <= 0 || previewSize.height <= 0) return const [];
+  final double sx = outWidth / previewSize.width;
+  final double sy = outHeight / previewSize.height;
+  final layers = <RasterLayer>[];
+  for (final f in fields) {
+    if (f.text.isEmpty) continue;
+    final painter = TextPainter(
+      text: TextSpan(
+          text: f.text,
+          style: cardFieldStyle(scale: f.scale, color: f.color, pixelScale: sx)),
+      textDirection: TextDirection.ltr,
+      textScaler: TextScaler.noScaling,
+    )..layout();
+    // Script fonts draw outside their line box; pad so nothing is clipped.
+    final int pad = (painter.preferredLineHeight * 0.5).ceil();
+    final int w = painter.width.ceil() + 2 * pad;
+    final int h = painter.height.ceil() + 2 * pad;
+    final recorder = ui.PictureRecorder();
+    painter.paint(ui.Canvas(recorder), Offset(pad.toDouble(), pad.toDouble()));
+    final picture = recorder.endRecording();
+    final image = await picture.toImage(w, h);
+    final data = await image.toByteData(format: ui.ImageByteFormat.rawStraightRgba);
+    image.dispose();
+    picture.dispose();
+    painter.dispose();
+    if (data == null) continue;
+    layers.add(RasterLayer(
+      data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+      w,
+      h,
+      (f.topLeft.dx * sx).round() - pad,
+      (f.topLeft.dy * sy).round() - pad,
+    ));
   }
+  return layers;
+}
 
-  ByteData fBitMapFontData = await loadAssetFont();
-  img.BitmapFont customFont =
-      img.BitmapFont.fromZip(fBitMapFontData.buffer.asUint8List());
-
-  var image = img.decodeImage(imageBytes);
-  if (image == null) return "";
-
-  // Actual image dimensions
-  int actualImageWidth = image.width;
-  int actualImageHeight = image.height;
-
-  // UI image dimensions (previously obtained)
-  double uiImageWidth = previewSize.width;
-  double uiImageHeight = previewSize.height;
-
-  // Calculate scaling factors
-  double scaleX = actualImageWidth / uiImageWidth;
-  double scaleY = actualImageHeight / uiImageHeight;
-
-  for (var textData in textDataList) {
-    // Scale the positions accurately
-    int adjustedX = (textData.dx * scaleX).toInt();
-    int adjustedY = (textData.dy * scaleY).toInt();
-
-    // TextData.scale is what the user set by pinch-resizing in the editor
-    // (image_create_screen.dart). It used to be ignored entirely here: drawString
-    // renders a FIXED-SIZE bitmap font, so every export came out at one size and the
-    // PDF never matched the preview.
-    //
-    // The bitmap font cannot be re-sized directly, so the text is drawn onto its own
-    // transparent layer, trimmed to its actual bounds, then composited at
-    // scale * scaleX. scaleX is used for both axes so the glyphs keep their aspect
-    // ratio — scaleX and scaleY differ whenever the preview box is not exactly the
-    // image's aspect ratio, and using each independently would stretch the text.
-    final double renderScale = textData.scale * scaleX;
-
-    // Generous layer; trimmed to the real glyph bounds immediately after drawing.
-    final int layerW = (textData.text.length + 2) * customFont.lineHeight;
-    final int layerH = customFont.lineHeight * 3;
-
-    var textLayer = img.Image(
-      width: layerW < 1 ? 1 : layerW,
-      height: layerH < 1 ? 1 : layerH,
+/// Pure: composites [layers] onto a copy of [base].
+img.Image composeCard(DecodedCard base, List<RasterLayer> layers) {
+  final image = base.toImage();
+  for (final l in layers) {
+    final layer = img.Image.fromBytes(
+      width: l.width,
+      height: l.height,
+      bytes: Uint8List.fromList(l.rgba).buffer,
       numChannels: 4,
     );
-
-    img.drawString(
-      textLayer,
-      textData.text,
-      font: customFont,
-      x: 0,
-      y: 0,
-      color: img.ColorFloat32.rgb(r, g, b),
-      maskChannel: img.Channel.red,
-    );
-
-    textLayer = img.trim(textLayer, mode: img.TrimMode.transparent);
-
-    final int dstW = (textLayer.width * renderScale).round();
-    final int dstH = (textLayer.height * renderScale).round();
-
-    if (dstW > 0 && dstH > 0) {
-      img.compositeImage(
-        image,
-        textLayer,
-        dstX: adjustedX,
-        dstY: adjustedY,
-        dstW: dstW,
-        dstH: dstH,
-      );
-    }
+    img.compositeImage(image, layer, dstX: l.x, dstY: l.y);
   }
-
-  var editedImageBytes = img.encodePng(image, level: 0);
-  editedImage = await convertBackImage(editedImageBytes);
-  return editedImage;
+  return image;
 }
 
-Future<File> saveImage(Uint8List imageBytes, String filePath) async {
-  File file = File(filePath);
-  await file.writeAsBytes(imageBytes);
-  return file;
+/// What a render produced. Either may be null if it was not requested.
+@immutable
+class RenderedCard {
+  const RenderedCard({this.png, this.pdf});
+  final Uint8List? png;
+  final Uint8List? pdf;
 }
 
-Future<String> convertBackImage(Uint8List editedImageBytes) async {
-  var documentDirectory = await getApplicationDocumentsDirectory();
-  String timestamp = "${DateTime.timestamp()}";
-  // Only the PNG is written. A second copy used to be saved as `<ts>_image.jpg`
-  // holding the *same PNG bytes* under a lying extension — nothing ever read it,
-  // and it doubled the disk this directory grows by on every single render.
-  final File file = await saveImage(
-      editedImageBytes, '${documentDirectory.path}/${timestamp}_image.png');
-  return file.path;
+/// Renders one card: text rasterised here, composite + encode (+ PDF) on a
+/// background isolate. Nothing is written to disk.
+///
+/// [base] can be decoded once and reused for every guest of a run (P-3).
+Future<RenderedCard> renderCard(
+  DecodedCard base,
+  List<FieldPaint> fields,
+  Size previewSize, {
+  bool png = true,
+  bool pdf = false,
+}) async {
+  final layers =
+      await rasteriseFields(fields, previewSize, base.width, base.height);
+  return Isolate.run(() {
+    final image = composeCard(base, layers);
+    // PNG level 6: much smaller than the old uncompressed level 0 (P-2).
+    final pngBytes = img.encodePng(image, level: 6);
+    return RenderedCard(
+      png: png ? pngBytes : null,
+      pdf: pdf ? buildPdfBytesSync(pngBytes) : null,
+    );
+  });
 }
 
-Future<String> createPdf(String imagePath, String name) async {
+/// Copies a picked image into `<documents>/cards/` so it survives the system
+/// clearing the app cache, where `image_picker` leaves it (F-2).
+Future<String> persistPickedImage(String sourcePath,
+    {Directory? documentsDir}) async {
+  final docs = documentsDir ?? await getApplicationDocumentsDirectory();
+  final cardsDir = Directory(p.join(docs.path, 'cards'));
+  await cardsDir.create(recursive: true);
+  if (p.isWithin(cardsDir.path, sourcePath)) return sourcePath;
+  final ext = p.extension(sourcePath);
+  final name = '${DateTime.now().microsecondsSinceEpoch}$ext';
+  final copy = await File(sourcePath).copy(p.join(cardsDir.path, name));
+  return copy.path;
+}
+
+// ---------------------------------------------------------------------------
+// PDF
+// ---------------------------------------------------------------------------
+
+const int _maxPdfNameLength = 80;
+
+/// Task 3.4 / F-9: a safe, unique PDF base name (no extension).
+///
+/// Strips `\ / : * ? " < > |` and control characters, trims, caps the length
+/// at 80, falls back to `invitation`, and de-duplicates against [taken]
+/// (case-insensitive) as `name (2)`, `name (3)`, ... Non-Latin text such as
+/// Gujarati is kept.
+String safePdfName(String raw, Set<String> taken) {
+  var name = raw
+      .replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1F\x7F]'), '')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+  // No leading dots (hidden files, "." and "..").
+  name = name.replaceFirst(RegExp(r'^\.+'), '').trim();
+  if (name.length > _maxPdfNameLength) {
+    name = name.substring(0, _maxPdfNameLength).trim();
+  }
+  if (name.isEmpty) name = 'invitation';
+  final lower = {for (final t in taken) t.toLowerCase()};
+  if (!lower.contains(name.toLowerCase())) return name;
+  for (var n = 2;; n++) {
+    final candidate = '$name ($n)';
+    if (!lower.contains(candidate.toLowerCase())) return candidate;
+  }
+}
+
+/// Where PDFs are written (decision D-4(c)): an app-private folder, shared
+/// through the system share sheet. Needs no storage permission on any version.
+Future<Directory> pdfOutputDir({Directory? documentsDir}) async {
+  final docs = documentsDir ?? await getApplicationDocumentsDirectory();
+  final dir = Directory(p.join(docs.path, 'invitations'));
+  await dir.create(recursive: true);
+  return dir;
+}
+
+/// Base names (without `.pdf`) already present in [dir].
+Set<String> existingPdfNames(Directory dir) => {
+      for (final f in dir.listSync().whereType<File>())
+        if (p.extension(f.path).toLowerCase() == '.pdf')
+          p.basenameWithoutExtension(f.path),
+    };
+
+/// Largest rect with the image's aspect ratio that fits inside [page] minus
+/// [margin] on every side, centred on both axes (F-18).
+Rect fitImageOnPage(Size image, Size page, double margin) {
+  final double maxW = page.width - 2 * margin;
+  final double maxH = page.height - 2 * margin;
+  if (image.width <= 0 || image.height <= 0 || maxW <= 0 || maxH <= 0) {
+    return Rect.zero;
+  }
+  final double scale = (maxW / image.width) < (maxH / image.height)
+      ? maxW / image.width
+      : maxH / image.height;
+  final double w = image.width * scale;
+  final double h = image.height * scale;
+  return Rect.fromLTWH((page.width - w) / 2, (page.height - h) / 2, w, h);
+}
+
+/// Pure: one A4 page with [imageBytes] fitted and a light-blue border.
+Uint8List buildPdfBytesSync(Uint8List imageBytes) {
   final document = PdfDocument();
-  document.pageSettings.setMargins(0);
-  // Create a new page without margins (full size)
-  final PdfPage page = document.pages.add();
-
-  // Get the page dimensions
-  final double pdfWidth = page.getClientSize().width;
-  final double pdfHeight = page.getClientSize().height;
-
-  // Load the image
-  final File image = File(imagePath);
-  final imageBytes = image.readAsBytesSync();
-  final PdfBitmap bitmap = PdfBitmap(imageBytes);
-
-  // Image dimensions
-  final double imageOriginalWidth = bitmap.width.toDouble();
-  final double imageOriginalHeight = bitmap.height.toDouble();
-
-  // Define border margin
-  const double borderMargin = 10.0;
-
-  // Scale image to fit full PDF width (minus margins)
-  final double scaledImageWidth = pdfWidth - (2 * borderMargin);
-  final double scaledImageHeight =
-      (imageOriginalHeight / imageOriginalWidth) * scaledImageWidth;
-
-  // Center image vertically
-  final double xOffset = borderMargin; // Leave space for left margin
-  final double yOffset =
-      (pdfHeight - scaledImageHeight - (2 * borderMargin)) / 2;
-
-  // Draw the light blue border rectangle
-  page.graphics.drawRectangle(
-    bounds: Rect.fromLTWH(
-        xOffset - borderMargin,
-        yOffset - borderMargin,
-        scaledImageWidth + (2 * borderMargin),
-        scaledImageHeight + (2 * borderMargin)),
-    pen: PdfPen(PdfColor(173, 216, 230)), // Light blue color
-  );
-
-  // Draw the image
-  page.graphics.drawImage(
-    bitmap,
-    Rect.fromLTWH(xOffset, yOffset, scaledImageWidth, scaledImageHeight),
-  );
-
-  // final outputDir = await getApplicationDocumentsDirectory();
-  // Save the PDF
-  final file = File(
-      "/storage/emulated/0/Download/${name.toLowerCase().replaceAll(" ", "_")}.pdf");
-  await file.writeAsBytes(await document.save());
-  document.dispose();
-
-  print("PDF saved at ${file.path}");
-
-  return file.path;
+  try {
+    document.pageSettings.setMargins(0);
+    final PdfPage page = document.pages.add();
+    final Size pageSize = page.getClientSize();
+    final PdfBitmap bitmap = PdfBitmap(imageBytes);
+    const double borderMargin = 10.0;
+    final Rect imageRect = fitImageOnPage(
+      Size(bitmap.width.toDouble(), bitmap.height.toDouble()),
+      pageSize,
+      borderMargin,
+    );
+    page.graphics.drawRectangle(
+      bounds: imageRect.inflate(borderMargin),
+      pen: PdfPen(PdfColor(173, 216, 230)),
+    );
+    page.graphics.drawImage(bitmap, imageRect);
+    return Uint8List.fromList(document.saveSync());
+  } finally {
+    document.dispose();
+  }
 }
 
-void saveTextData(
-    String text, double x, double y, double width, double height) {}
+/// Writes [pdfBytes] as `<safe name>.pdf` in [dir] (the app PDF folder by
+/// default) without overwriting anything. Returns the file path.
+Future<String> writePdf(Uint8List pdfBytes, String name,
+    {Directory? dir}) async {
+  final outDir = dir ?? await pdfOutputDir();
+  final base = safePdfName(name, existingPdfNames(outDir));
+  final file = File(p.join(outDir.path, '$base.pdf'));
+  await file.writeAsBytes(pdfBytes, flush: true);
+  debugPrint('PDF saved at ${file.path}');
+  return file.path;
+}

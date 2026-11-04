@@ -1,5 +1,5 @@
 name: invitation_edit_send
-description: "A new Flutter project."
+description: "Design an invitation card once, then render one personalised card and PDF per guest."
 publish_to: 'none'
 
 version: 1.0.0+1
@@ -10,12 +10,11 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
+  path: ^1.9.0
   path_provider: ^2.1.5
   # flutter_whatsapp_stickers: ^1.0.1+5
   image: ^4.5.2
-  http: ^1.2.2
   syncfusion_flutter_pdf: ^28.1.38
-  translator: ^1.0.3+1
   sqflite: ^2.4.1
   permission_handler: ^11.3.1
   image_picker: ^1.1.2
@@ -23,6 +22,7 @@ dependencies:
   get: ^4.6.6
   intl_phone_field: ^3.2.0
   whatsapp: ^3.0.0
+  share_plus: ^11.1.0
   # whatsapp_share2: ^2.0.2
   # url_launcher: ^6.3.1
   # shimmer: ^3.0.0
@@ -31,40 +31,28 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  sqflite_common_ffi: ^2.4.0+3
 
 flutter:
   uses-material-design: true
 
   assets:
     - assets/images/
-    - fonts/font_zip/Kalapi_Regular_True_Type.TTF.zip
-    - fonts/font_zip/Rasa.zip
-    - fonts/font_zip/vertopal.com_Rasa-Italic-VariableFont_wght.zip
-    - fonts/font_zip/Gujrati-Saral-1.ttf.zip
-    - fonts/font_zip/PlaywriteIN-VariableFont_wght.ttf.zip
-    - fonts/font_zip/PlaywriteIN-VariableFont_wght.ttf (1).zip
-    - fonts/font_zip/PlaywriteIN-VariableFont_wght.ttf (2).zip
+    # The old bitmap-font zips in fonts/font_zip/ are no longer bundled: card
+    # text is rendered with Flutter's text engine (lib/utils/common.dart).
 
   fonts:
+    # UI text (plan 5.1): one family with real weights.
     - family: Nunito
       fonts:
         - asset: fonts/nunito.ttf
-
-    - family: NunitoBold
-      fonts:
-        - asset: fonts/nunitobold.ttf
-
-    - family: NunitoItalic
-      fonts:
-        - asset: fonts/nunitoitalic.ttf
-
-    - family: NunitoLight
-      fonts:
         - asset: fonts/nunitolight.ttf
-
-    - family: NunitoSans
-      fonts:
-        - asset: fonts/nunitosans.ttf
+          weight: 300
+        - asset: fonts/nunitobold.ttf
+          weight: 700
+        - asset: fonts/nunitoitalic.ttf
+          style: italic
+    # Gujarati: UI fallback and card-text fallback.
     - family: NotoSerif
       fonts:
         - asset: fonts/NotoSerifGujarati-VariableFont_wght.ttf
